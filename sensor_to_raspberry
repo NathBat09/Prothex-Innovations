@@ -1,0 +1,78 @@
+#!/usr/bin/python3
+
+import signal
+import sys
+import time
+import spidev
+import RPi.GPIO as GPIO
+
+# SPI channel for ADC (adjust if needed)
+spi_ch = 0
+spi = spidev.SpiDev(0, spi_ch)
+spi.max_speed_hz = 1200000
+
+# Set up PWM output on a GPIO pin (for example, BCM pin 18)
+PWM_PIN = 18
+GPIO.setmode(GPIO.BCM)
+GPIO.setup(PWM_PIN, GPIO.OUT)
+pwm = GPIO.PWM(PWM_PIN, 1000)  # PWM frequency of 1kHz
+pwm.start(0)  # Start with 0% duty cycle
+
+def close(signal_received, frame):
+    pwm.stop()
+    GPIO.cleanup()
+    sys.exit(0)
+
+signal.signal(signal.SIGINT, close)
+
+def get_adc(channel):
+    # Ensure channel is either 0 or 1 (adjust if your ADC supports more channels)
+    if channel != 0:
+        channel = 1
+
+    # Construct SPI message:
+    #   - First two bits: start and single/diff bit
+    #   - Third bit: channel selection (0 or 1)
+    #   - Remaining bits: don’t care
+    msg = 0b11        # Start + single mode
+    msg = ((msg << 1) + channel) << 5
+    msg = [msg, 0x00]
+    
+    # Transfer the SPI message and receive reply
+    reply = spi.xfer2(msg)
+    
+    # Combine the two bytes received into a single integer
+    adc = 0
+    for byte in reply:
+        adc = (adc << 8) + byte
+    adc = adc >> 1  # Remove the last (unused) bit
+    
+    return adc  # Raw sensor value (0-1023)
+
+def map_value(x, in_min, in_max, out_min, out_max):
+    """Map value x from one range to another (integer result)."""
+    return int((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
+
+if __name__ == '__main__':
+    try:
+        while True:
+            # Read sensor value from ADC channel 0
+            sensor_value = get_adc(0)
+            
+            # Map sensor value (0-1023) to output value (0-255)
+            output_value = map_value(sensor_value, 0, 1023, 0, 255)
+            
+            # Convert the 0-255 output to a PWM duty cycle percentage (0-100)
+            duty_cycle = (output_value / 255.0) * 100
+            
+            # Update PWM output (simulate Arduino's analogWrite)
+            pwm.ChangeDutyCycle(duty_cycle)
+            
+            # Print sensor and output values to the terminal
+            print("sensor =", sensor_value,
+                  "\t output =", output_value,
+                  "\t PWM duty =", round(duty_cycle, 1))
+            
+            time.sleep(0.2)
+    except KeyboardInterrupt:
+        close(None, None)
