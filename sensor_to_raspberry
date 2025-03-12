@@ -1,78 +1,140 @@
-#!/usr/bin/python3
-
-import signal
-import sys
+#!/usr/bin/env python3
 import time
 import spidev
 import RPi.GPIO as GPIO
 
-# SPI channel for ADC (adjust if needed)
-spi_ch = 0
-spi = spidev.SpiDev(0, spi_ch)
-spi.max_speed_hz = 1200000
+# --- Parámetros y constantes ---
+SAMPLE_RATE = 500                  # Frecuencia de muestreo (Hz)
+SAMPLE_PERIOD = 1.0 / SAMPLE_RATE  # Período de muestreo en segundos
+BUFFER_SIZE = 128                  # Tamaño del buffer circular para el cálculo de la envolvente
+MOTOR_PIN = 3                      # Pin de salida (en BCM) para controlar el motor o señal digital
 
-# Set up PWM output on a GPIO pin (for example, BCM pin 18)
-PWM_PIN = 18
+# --- Configuración del SPI para el ADC (MCP3002) ---
+spi = spidev.SpiDev()
+spi.open(0, 0)                     # Abrir bus 0, dispositivo 0 (CS0)
+spi.max_speed_hz = 1200000         # Velocidad del SPI
+
+# --- Configuración del GPIO ---
 GPIO.setmode(GPIO.BCM)
-GPIO.setup(PWM_PIN, GPIO.OUT)
-pwm = GPIO.PWM(PWM_PIN, 1000)  # PWM frequency of 1kHz
-pwm.start(0)  # Start with 0% duty cycle
+GPIO.setup(MOTOR_PIN, GPIO.OUT)
 
-def close(signal_received, frame):
-    pwm.stop()
-    GPIO.cleanup()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, close)
+# --- Variables globales para la detección de envolvente ---
+circular_buffer = [0] * BUFFER_SIZE
+data_index = 0
+sum_val = 0
 
 def get_adc(channel):
-    # Ensure channel is either 0 or 1 (adjust if your ADC supports more channels)
+    """
+    Lee el valor analógico (0-1023) del ADC (MCP3002) en el canal indicado.
+    Se asume que solo se usan los canales 0 y 1.
+    """
     if channel != 0:
         channel = 1
-
-    # Construct SPI message:
-    #   - First two bits: start and single/diff bit
-    #   - Third bit: channel selection (0 or 1)
-    #   - Remaining bits: don’t care
-    msg = 0b11        # Start + single mode
+    # Construir el mensaje SPI:
+    #  - Primeros dos bits: Start y modo single-ended (11)
+    #  - Tercer bit: Selección de canal (0 o 1)
+    #  - El resto se rellena con 0
+    msg = 0b11
     msg = ((msg << 1) + channel) << 5
-    msg = [msg, 0x00]
-    
-    # Transfer the SPI message and receive reply
+    msg = [msg, 0]
     reply = spi.xfer2(msg)
-    
-    # Combine the two bytes received into a single integer
     adc = 0
     for byte in reply:
         adc = (adc << 8) + byte
-    adc = adc >> 1  # Remove the last (unused) bit
-    
-    return adc  # Raw sensor value (0-1023)
+    adc = adc >> 1  # Se elimina el bit extra
+    return adc
 
-def map_value(x, in_min, in_max, out_min, out_max):
-    """Map value x from one range to another (integer result)."""
-    return int((x - in_min) * (out_max - out_min) / (in_max - in_min) + out_min)
+def getEnvelope(abs_emg):
+    """
+    Calcula la envolvente mediante un promedio móvil en un buffer circular.
+    Se multiplica el promedio por 2, tal como en el código original.
+    """
+    global circular_buffer, data_index, sum_val
+    sum_val -= circular_buffer[data_index]
+    sum_val += abs_emg
+    circular_buffer[data_index] = abs_emg
+    data_index = (data_index + 1) % BUFFER_SIZE
+    envelope = (sum_val // BUFFER_SIZE) * 2
+    return envelope
 
-if __name__ == '__main__':
+def EMGFilter(input_value):
+    """
+    Aplica en cascada 4 filtros IIR (Band-Pass Butterworth) al valor de entrada.
+    Se usan atributos de función para almacenar las variables estáticas de cada bloque.
+    """
+    output = float(input_value)
+    if not hasattr(EMGFilter, "z1_1"):
+        # Bloque 1
+        EMGFilter.z1_1 = 0.0
+        EMGFilter.z2_1 = 0.0
+        # Bloque 2
+        EMGFilter.z1_2 = 0.0
+        EMGFilter.z2_2 = 0.0
+        # Bloque 3
+        EMGFilter.z1_3 = 0.0
+        EMGFilter.z2_3 = 0.0
+        # Bloque 4
+        EMGFilter.z1_4 = 0.0
+        EMGFilter.z2_4 = 0.0
+
+    # Bloque 1
+    x = output - 0.05159732 * EMGFilter.z1_1 - 0.36347401 * EMGFilter.z2_1
+    output = 0.01856301 * x + 0.03712602 * EMGFilter.z1_1 + 0.01856301 * EMGFilter.z2_1
+    EMGFilter.z2_1 = EMGFilter.z1_1
+    EMGFilter.z1_1 = x
+
+    # Bloque 2
+    # Nota: En el código original se usa "output - -0.53945795 * z1" que equivale a output + 0.53945795 * z1
+    x = output + 0.53945795 * EMGFilter.z1_2 - 0.39764934 * EMGFilter.z2_2
+    output = 1.0 * x - 2.0 * EMGFilter.z1_2 + 1.0 * EMGFilter.z2_2
+    EMGFilter.z2_2 = EMGFilter.z1_2
+    EMGFilter.z1_2 = x
+
+    # Bloque 3
+    x = output - 0.47319594 * EMGFilter.z1_3 - 0.70744137 * EMGFilter.z2_3
+    output = 1.0 * x + 2.0 * EMGFilter.z1_3 + 1.0 * EMGFilter.z2_3
+    EMGFilter.z2_3 = EMGFilter.z1_3
+    EMGFilter.z1_3 = x
+
+    # Bloque 4
+    x = output + 1.00211112 * EMGFilter.z1_4 - 0.74520226 * EMGFilter.z2_4
+    output = 1.0 * x - 2.0 * EMGFilter.z1_4 + 1.0 * EMGFilter.z2_4
+    EMGFilter.z2_4 = EMGFilter.z1_4
+    EMGFilter.z1_4 = x
+
+    return output
+
+def main():
+    print("Timestamp,Raw_EMG,Envelope,DigitalOutput")
     try:
         while True:
-            # Read sensor value from ADC channel 0
+            start_time = time.time()
+            # Leer valor analógico del ADC (canal 0)
             sensor_value = get_adc(0)
-            
-            # Map sensor value (0-1023) to output value (0-255)
-            output_value = map_value(sensor_value, 0, 1023, 0, 255)
-            
-            # Convert the 0-255 output to a PWM duty cycle percentage (0-100)
-            duty_cycle = (output_value / 255.0) * 100
-            
-            # Update PWM output (simulate Arduino's analogWrite)
-            pwm.ChangeDutyCycle(duty_cycle)
-            
-            # Print sensor and output values to the terminal
-            print("sensor =", sensor_value,
-                  "\t output =", output_value,
-                  "\t PWM duty =", round(duty_cycle, 1))
-            
-            time.sleep(0.2)
+            # Aplicar el filtro EMG
+            filtered_signal = EMGFilter(sensor_value)
+            # Calcular la envolvente a partir del valor absoluto del filtro
+            envelope = getEnvelope(abs(filtered_signal))
+            # Determinar la salida digital según el umbral (5)
+            if envelope <= 5:
+                GPIO.output(MOTOR_PIN, GPIO.LOW)
+                digital_output = 0
+            else:
+                GPIO.output(MOTOR_PIN, GPIO.HIGH)
+                digital_output = 1
+            # Imprimir datos (timestamp, valor crudo, envolvente y salida digital)
+            timestamp = time.time()
+            print(f"{timestamp:.3f},{sensor_value},{envelope},{digital_output}")
+            # Espera para mantener la frecuencia de muestreo
+            elapsed = time.time() - start_time
+            sleep_time = SAMPLE_PERIOD - elapsed
+            if sleep_time > 0:
+                time.sleep(sleep_time)
     except KeyboardInterrupt:
-        close(None, None)
+        print("Interrupción detectada. Saliendo...")
+    finally:
+        GPIO.cleanup()
+        spi.close()
+
+if __name__ == "__main__":
+    main()
