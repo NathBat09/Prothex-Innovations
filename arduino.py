@@ -1,13 +1,22 @@
-import serial
+import asyncio
+import serial_asyncio
 
-# Open the serial port that the Arduino is connected to.
-# Check the port name; it might be '/dev/ttyACM0' or '/dev/ttyUSB0'
-ser = serial.Serial('/dev/ttyACM0', 9600)
+class SerialReader(asyncio.Protocol):
+    def connection_made(self, transport):
+        self.transport = transport
+        print("Serial port opened:", transport)
 
-while True:
-    try:
-        line = ser.readline().decode('utf-8').strip()  # Read and decode the line
-        if line:
-            print("Received:", line)
-    except Exception as e:
-        print("Error:", e)
+    def data_received(self, data):
+        # Process incoming data immediately
+        print("Received:", data.decode('utf-8').strip())
+
+    def connection_lost(self, exc):
+        print("Serial port closed")
+        asyncio.get_event_loop().stop()
+
+async def main():
+    loop = asyncio.get_running_loop()
+    # Replace '/dev/ttyACM0' with your actual serial port.
+    await serial_asyncio.create_serial_connection(loop, SerialReader, '/dev/ttyACM0', baudrate=115200)
+
+asyncio.run(main())
