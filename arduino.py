@@ -1,22 +1,23 @@
-import asyncio
-import serial_asyncio
+import serial
+import threading
 
-class SerialReader(asyncio.Protocol):
-    def connection_made(self, transport):
-        self.transport = transport
-        print("Serial port opened:", transport)
+def read_serial(ser):
+    while True:
+        try:
+            # Read all available data without blocking too long.
+            if ser.in_waiting:
+                line = ser.readline().decode('utf-8').strip()
+                if line:
+                    print("Received:", line)
+        except Exception as e:
+            print("Error:", e)
 
-    def data_received(self, data):
-        # Process incoming data immediately
-        print("Received:", data.decode('utf-8').strip())
+ser = serial.Serial('/dev/ttyACM0', 115200, timeout=0.1)
+thread = threading.Thread(target=read_serial, args=(ser,))
+thread.daemon = True  # Allows the program to exit even if thread is running
+thread.start()
 
-    def connection_lost(self, exc):
-        print("Serial port closed")
-        asyncio.get_event_loop().stop()
-
-async def main():
-    loop = asyncio.get_running_loop()
-    # Replace '/dev/ttyACM0' with your actual serial port.
-    await serial_asyncio.create_serial_connection(loop, SerialReader, '/dev/ttyACM0', baudrate=115200)
-
-asyncio.run(main())
+# Main loop can perform other tasks without delay.
+while True:
+    # Replace this with other processing
+    pass
